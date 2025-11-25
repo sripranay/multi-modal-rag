@@ -1,83 +1,101 @@
-# vector_store.py 
+"""
+vector_store.py
+
+Simple VectorStore wrapper using sentence-transformers + faiss.
+Methods:
+  - create_embeddings(chunks): compute embeddings for each chunk and build FAISS
+  - save(path): saves index and chunks metadata
+  - load(path): loads index and chunks metadata
+  - search(query, k=5): returns list of dicts {"chunk": <chunk>, "score": <score>}
+"""
 import os
 import json
+import pickle
+
 import numpy as np
+import faiss
 from sentence_transformers import SentenceTransformer
 
 class VectorStore:
-    def __init__(self, model_name="sentence-transformers/all-MiniLM-L6-v2", batch_size=32):
+    def __init__(self, model_name="sentence-transformers/all-MiniLM-L6-v2", dim=None):
         self.model_name = model_name
-        self.batch_size = batch_size
-        self.model = SentenceTransformer(self.model_name)
+        self.model = None
+        self.index = None
         self.chunks = []
-        self.vectors = None  # numpy array (n, d)
+        self.dim = dim
 
-    def _embed_texts(self, texts):
-        embs = self.model.encode(texts, batch_size=self.batch_size, convert_to_numpy=True)
-        embs = embs.astype(np.float32)
-        norms = np.linalg.norm(embs, axis=1, keepdims=True)
-        norms[norms == 0] = 1e-12
-        embs = embs / norms
-        return embs
+    def _ensure_model(self):
+        if self.model is None:
+            print(f"Loading embedding model: {self.model_name}")
+            self.model = SentenceTransformer(self.model_name)
+            # set dim if not set
+            if self.dim is None:
+                self.dim = self.model.get_sentence_embedding_dimension()
+            print("successfully loaded")
 
     def create_embeddings(self, chunks):
         """
         chunks: list of dicts with 'content' key
         """
-        self.chunks = chunks[:]
-        texts = [str(c.get("content","")) for c in self.chunks]
-        if len(texts) == 0:
-            self.vectors = np.zeros((0,1), dtype=np.float32)
-            return
-        # batch embedding
-        emb_list = []
-        for i in range(0, len(texts), self.batch_size):
-            batch = texts[i:i+self.batch_size]
-            emb_list.append(self._embed_texts(batch))
-        self.vectors = np.vstack(emb_list)
+        self._ensure_model()
+        self.chunks = chunks
+        texts = [c.get("content", "") for c in chunks]
+        # encode in batches
+        embeddings = self.model.encode(texts, show_progress_bar=True, convert_to_numpy=True)
+        # ensure dtype float32 for faiss
+        embeddings = np.array(embeddings).astype("float32")
+        # build index
+        self.index = faiss.IndexFlatIP(self.dim)  # inner product for cosine (we will normalize)
+        # normalize embeddings for cosine
+        faiss.normalize_L2(embeddings)
+        self.index.add(embeddings)
+        print(f"FAISS index with {self.index.ntotal} vectors")
 
     def save(self, path):
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        # save chunks and vectors
-        with open(path + "_chunks.json", "w", encoding="utf-8") as f:
-            json.dump(self.chunks, f, ensure_ascii=False, indent=2)
-        if self.vectors is not None:
-            np.save(path + "_vectors.npy", self.vectors)
+        """
+        Save index and chunks metadata. 'path' is directory path.
+        """
+        os.makedirs(path, exist_ok=True)
+        # index file
+        idx_file = os.path.join(path, "index.faiss")
+        faiss.write_index(self.index, idx_file)
+        # metadata
+        meta_file = os.path.join(path, "chunks.pkl")
+        with open(meta_file, "wb") as f:
+            pickle.dump(self.chunks, f)
+        print(f"Saved index to {path}")
 
     def load(self, path):
-        chunks_path = path + "_chunks.json"
-        vectors_path = path + "_vectors.npy"
-        if os.path.exists(chunks_path):
-            with open(chunks_path, "r", encoding="utf-8") as f:
-                self.chunks = json.load(f)
-        else:
-            self.chunks = []
-        if os.path.exists(vectors_path):
-            self.vectors = np.load(vectors_path).astype(np.float32)
-        else:
-            self.vectors = None
-
-    def _search_numpy(self, query_emb, k=5):
-        if self.vectors is None or self.vectors.shape[0] == 0:
-            return []
-        scores = np.dot(self.vectors, query_emb.astype(np.float32))
-        if k >= len(scores):
-            idxs = np.argsort(-scores)
-        else:
-            idxs = np.argpartition(-scores, k-1)[:k]
-            idxs = idxs[np.argsort(-scores[idxs])]
-        return [(float(scores[i]), int(i)) for i in idxs]
+        """
+        Load index and metadata from directory.
+        """
+        idx_file = os.path.join(path, "index.faiss")
+        meta_file = os.path.join(path, "chunks.pkl")
+        if not os.path.exists(idx_file) or not os.path.exists(meta_file):
+            raise FileNotFoundError("Index or metadata missing in " + path)
+        self.index = faiss.read_index(idx_file)
+        with open(meta_file, "rb") as f:
+            self.chunks = pickle.load(f)
+        # set dim
+        self.dim = self.index.d
+        # lazy-load model only when creating embeddings or searching with query->embedding
+        print(f"Loaded FAISS index with {self.index.ntotal} vectors")
 
     def search(self, query, k=5):
-        if not query:
-            return []
-        q_emb = self._embed_texts([query])[0]
-        norm = np.linalg.norm(q_emb)
-        if norm > 0:
-            q_emb = q_emb / norm
-        hits = self._search_numpy(q_emb, k=k)
+        """
+        Returns list of dicts: {"chunk": chunk, "score": score}
+        If model not loaded (for encoding), instantiate it transiently.
+        """
+        if self.index is None:
+            raise RuntimeError("Index not loaded")
+        # ensure model available to encode query
+        self._ensure_model()
+        q_emb = self.model.encode([query], convert_to_numpy=True).astype("float32")
+        faiss.normalize_L2(q_emb)
+        D, I = self.index.search(q_emb, k)
         results = []
-        for score, idx in hits:
-            chunk = self.chunks[idx] if idx < len(self.chunks) else {}
-            results.append({"chunk": chunk, "score": score})
+        for score, idx in zip(D[0], I[0]):
+            if idx < 0:
+                continue
+            results.append({"chunk": self.chunks[int(idx)], "score": float(score)})
         return results
