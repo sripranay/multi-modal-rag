@@ -1,12 +1,11 @@
+# process_document.py
 import os
 import json
-import pdfplumber
-from PyPDF2 import PdfReader
+from typing import List, Optional
 
 RAW_DIR = "data/raw"
 PROCESSED_DIR = "data/processed"
 IMAGES_DIR = "data/images"
-
 CHUNKS_PATH = os.path.join(PROCESSED_DIR, "chunks.json")
 
 
@@ -17,80 +16,102 @@ def ensure_dirs():
     print("All directories created")
 
 
-def extract_text_pdfplumber(pdf_path):
+def extract_text_pypdf2(pdf_path: str) -> Optional[str]:
     try:
-        with pdfplumber.open(pdf_path) as pdf:
-            return "\n".join(page.extract_text() or "" for page in pdf.pages)
+        from PyPDF2 import PdfReader
     except Exception as e:
-        print("pdfplumber failed:", e)
+        print("PyPDF2 import failed:", e)
         return None
 
-
-def extract_text_pypdf2(pdf_path):
     try:
         reader = PdfReader(pdf_path)
-        return "\n".join(page.extract_text() or "" for page in reader.pages)
+        texts = []
+        for page in reader.pages:
+            txt = page.extract_text()
+            if txt:
+                texts.append(txt)
+        return "\n".join(texts)
     except Exception as e:
-        print("PyPDF2 failed:", e)
+        print("PyPDF2 extraction failed:", e)
         return None
 
 
-def chunk_text(text, max_len=800):
+def extract_text_pdfminer(pdf_path: str) -> Optional[str]:
+    try:
+        # pdfminer.six based extraction (fallback)
+        from io import StringIO
+        from pdfminer.high_level import extract_text_to_fp
+    except Exception as e:
+        print("pdfminer import failed:", e)
+        return None
+
+    try:
+        output_string = StringIO()
+        with open(pdf_path, "rb") as fh:
+            extract_text_to_fp(fh, output_string)
+        return output_string.getvalue()
+    except Exception as e:
+        print("pdfminer extraction failed:", e)
+        return None
+
+
+def chunk_text(text: str, max_tokens: int = 800) -> List[str]:
+    # simple chunk by words; adjust max_tokens as needed
     words = text.split()
-    chunks, current = [], []
-
+    chunks = []
+    cur = []
     for w in words:
-        current.append(w)
-        if len(current) >= max_len:
-            chunks.append(" ".join(current))
-            current = []
-
-    if current:
-        chunks.append(" ".join(current))
-
+        cur.append(w)
+        if len(cur) >= max_tokens:
+            chunks.append(" ".join(cur))
+            cur = []
+    if cur:
+        chunks.append(" ".join(cur))
     return chunks
 
 
-def process_document(selected_file_path):
+def process_document(pdf_path: str) -> bool:
     ensure_dirs()
 
-    if not selected_file_path:
-        print("ERROR: No file selected")
+    if not pdf_path:
+        print("ERROR: No file path provided.")
         return False
 
-    if not os.path.exists(selected_file_path):
-        print("ERROR: File not found:", selected_file_path)
+    if not os.path.exists(pdf_path):
+        print("ERROR: File not found:", pdf_path)
         return False
 
     print("Found PDF")
-    print("Processing document:", selected_file_path)
+    print("Processing document:", pdf_path)
 
-    # --- Try pdfplumber
-    text = extract_text_pdfplumber(selected_file_path)
+    # Try PyPDF2 first (pure python)
+    text = extract_text_pypdf2(pdf_path)
+    if text and text.strip():
+        print("Extracted text using PyPDF2")
+    else:
+        print("PyPDF2 extraction empty or failed, trying pdfminer...")
+        text = extract_text_pdfminer(pdf_path)
 
-    # --- Fallback
-    if not text:
-        text = extract_text_pypdf2(selected_file_path)
-
-    if not text:
-        print("ERROR: Neither pdfplumber nor PyPDF2 available.")
+    if not text or not text.strip():
+        print("ERROR: Could not extract text with PyPDF2 or pdfminer.")
         return False
 
-    # --- Chunk text
     chunks = chunk_text(text)
-
-    # Save chunks
     with open(CHUNKS_PATH, "w", encoding="utf-8") as f:
-        json.dump(chunks, f, indent=2)
+        json.dump(chunks, f, indent=2, ensure_ascii=False)
 
-    print(f"Saved chunks to {CHUNKS_PATH}")
+    print(f"Saved {len(chunks)} chunks to {CHUNKS_PATH}")
     return True
 
 
 if __name__ == "__main__":
     import sys
+
     if len(sys.argv) < 2:
         print("Usage: python process_document.py <pdf_path>")
-        exit()
+        sys.exit(1)
 
-    process_document(sys.argv[1])
+    target = sys.argv[1]
+    ok = process_document(target)
+    if not ok:
+        sys.exit(2)
