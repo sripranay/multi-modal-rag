@@ -1,64 +1,83 @@
-
+# vector_store.py 
 import os
-import numpy as np
-import faiss
-from sentence_transformers import SentenceTransformer
 import json
+import numpy as np
+from sentence_transformers import SentenceTransformer
 
 class VectorStore:
-    def __init__(self, model_name="sentence-transformers/all-MiniLM-L6-v2"):
+    def __init__(self, model_name="sentence-transformers/all-MiniLM-L6-v2", batch_size=32):
         self.model_name = model_name
-        self.model = SentenceTransformer(model_name)
-        self.embeddings = None
-        self.index = None
+        self.batch_size = batch_size
+        self.model = SentenceTransformer(self.model_name)
         self.chunks = []
+        self.vectors = None  # numpy array (n, d)
+
+    def _embed_texts(self, texts):
+        embs = self.model.encode(texts, batch_size=self.batch_size, convert_to_numpy=True)
+        embs = embs.astype(np.float32)
+        norms = np.linalg.norm(embs, axis=1, keepdims=True)
+        norms[norms == 0] = 1e-12
+        embs = embs / norms
+        return embs
 
     def create_embeddings(self, chunks):
-        texts = [c["content"] for c in chunks]
-        self.chunks = chunks
-
-        print("Embedding", len(texts), "chunks...")
-        vectors = self.model.encode(texts, convert_to_numpy=True)
-        self.embeddings = vectors
-
-        dim = vectors.shape[1]
-        index = faiss.IndexFlatL2(dim)
-        index.add(vectors)
-        self.index = index
+        """
+        chunks: list of dicts with 'content' key
+        """
+        self.chunks = chunks[:]
+        texts = [str(c.get("content","")) for c in self.chunks]
+        if len(texts) == 0:
+            self.vectors = np.zeros((0,1), dtype=np.float32)
+            return
+        # batch embedding
+        emb_list = []
+        for i in range(0, len(texts), self.batch_size):
+            batch = texts[i:i+self.batch_size]
+            emb_list.append(self._embed_texts(batch))
+        self.vectors = np.vstack(emb_list)
 
     def save(self, path):
         os.makedirs(os.path.dirname(path), exist_ok=True)
-
-        faiss.write_index(self.index, path + ".faiss")
-
+        # save chunks and vectors
         with open(path + "_chunks.json", "w", encoding="utf-8") as f:
             json.dump(self.chunks, f, ensure_ascii=False, indent=2)
+        if self.vectors is not None:
+            np.save(path + "_vectors.npy", self.vectors)
 
     def load(self, path):
-        faiss_path = path + ".faiss"
         chunks_path = path + "_chunks.json"
+        vectors_path = path + "_vectors.npy"
+        if os.path.exists(chunks_path):
+            with open(chunks_path, "r", encoding="utf-8") as f:
+                self.chunks = json.load(f)
+        else:
+            self.chunks = []
+        if os.path.exists(vectors_path):
+            self.vectors = np.load(vectors_path).astype(np.float32)
+        else:
+            self.vectors = None
 
-        if not os.path.exists(faiss_path):
-            raise FileNotFoundError("FAISS file not found: " + faiss_path)
-        if not os.path.exists(chunks_path):
-            raise FileNotFoundError("Chunks file not found: " + chunks_path)
-
-        self.index = faiss.read_index(faiss_path)
-        with open(chunks_path, "r", encoding="utf-8") as f:
-            self.chunks = json.load(f)
+    def _search_numpy(self, query_emb, k=5):
+        if self.vectors is None or self.vectors.shape[0] == 0:
+            return []
+        scores = np.dot(self.vectors, query_emb.astype(np.float32))
+        if k >= len(scores):
+            idxs = np.argsort(-scores)
+        else:
+            idxs = np.argpartition(-scores, k-1)[:k]
+            idxs = idxs[np.argsort(-scores[idxs])]
+        return [(float(scores[i]), int(i)) for i in idxs]
 
     def search(self, query, k=5):
-        q_vec = self.model.encode([query], convert_to_numpy=True)
-        D, I = self.index.search(q_vec, k)
-
+        if not query:
+            return []
+        q_emb = self._embed_texts([query])[0]
+        norm = np.linalg.norm(q_emb)
+        if norm > 0:
+            q_emb = q_emb / norm
+        hits = self._search_numpy(q_emb, k=k)
         results = []
-        for score, idx in zip(D[0], I[0]):
-            if idx == -1:
-                continue
-            chunk = self.chunks[idx]
-            results.append({
-                "chunk": chunk,
-                "score": float(score),
-                "source": chunk.get("source", "unknown")
-            })
+        for score, idx in hits:
+            chunk = self.chunks[idx] if idx < len(self.chunks) else {}
+            results.append({"chunk": chunk, "score": score})
         return results
