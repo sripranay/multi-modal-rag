@@ -1,181 +1,167 @@
+#!/usr/bin/env python3
 """
-process_document.py — Cloud-safe version
-Extracts:
-  • text (always – pdfplumber or PyPDF2 fallback)
-  • tables (if pdfplumber)
-  • images (if pdfplumber)
-  • OCR on images (optional)
-Outputs chunks → saved to processed/extracted_chunks.json
-"""
+process_document.py
 
-import os
+Usage:
+  python process_document.py [--input <pdf_path>]
+
+This script extracts text, tables (if pdfplumber available) and saves an
+array of "chunks" to config.CHUNKS_PATH as UTF-8 JSON.
+
+Chunk format:
+  {
+    "type": "text"|"table"|"image",
+    "content": "....",
+    "page": <page_number>,
+    "source": "<filename>"
+  }
+"""
 import json
+import os
 import sys
-import pathlib
+import argparse
+from pathlib import Path
+
 import config
 
-# -----------------------------
-# IMPORTS WITH SAFE FALLBACKS
-# -----------------------------
+# Try multiple PDF backends
+HAS_PDFPLUMBER = False
+HAS_PYPDF2 = False
+HAS_PYMUPDF = False
 
-# pdfplumber (best quality)
 try:
     import pdfplumber
-    _PDFPLUMBER_OK = True
+    HAS_PDFPLUMBER = True
 except Exception:
-    _PDFPLUMBER_OK = False
+    pass
 
-# PyPDF2 fallback (always available + light)
 try:
     import PyPDF2
-    _PYPDF2_OK = True
+    HAS_PYPDF2 = True
 except Exception:
-    _PYPDF2_OK = False
+    pass
 
-# OCR optional
 try:
-    import pytesseract
-    from PIL import Image
-    _OCR_OK = True
+    import fitz  # pymupdf
+    HAS_PYMUPDF = True
 except Exception:
-    _OCR_OK = False
+    pass
 
+def ensure_dirs():
+    Path(config.DATA_DIR).mkdir(parents=True, exist_ok=True)
+    Path(config.RAW_DATA_DIR).mkdir(parents=True, exist_ok=True)
+    Path(config.PROCESSED_DATA_DIR).mkdir(parents=True, exist_ok=True)
+    Path(config.VECTOR_STORE_DIR).mkdir(parents=True, exist_ok=True)
+    Path(config.IMAGES_DIR).mkdir(parents=True, exist_ok=True)
+    print("All directories created")
 
 def extract_with_pdfplumber(pdf_path):
-    """Extract text, tables, images using pdfplumber (best)."""
     chunks = []
-
     with pdfplumber.open(pdf_path) as pdf:
-        for page_num, page in enumerate(pdf.pages, start=1):
-
-            # TEXT
-            text = page.extract_text() or ""
-            if text.strip():
-                chunks.append({
-                    "page": page_num,
-                    "type": "text",
-                    "content": text,
-                    "source": pdf_path
-                })
-
-            # TABLES
+        for i, page in enumerate(pdf.pages, start=1):
+            text = (page.extract_text() or "").strip()
+            if text:
+                chunks.append({"type":"text","content":text,"page":i,"source":os.path.basename(pdf_path)})
+            # tables
             try:
                 tables = page.extract_tables()
-                for t in tables:
-                    if t:
-                        table_str = "\n".join([", ".join(row) for row in t])
-                        chunks.append({
-                            "page": page_num,
-                            "type": "table",
-                            "content": table_str,
-                            "source": pdf_path
-                        })
-            except:
+                if tables:
+                    for t in tables:
+                        # join rows with pipes for simple representation
+                        rows = ["\t".join([cell if cell is not None else "" for cell in row]) for row in t]
+                        table_text = "\n".join(rows)
+                        chunks.append({"type":"table","content":table_text,"page":i,"source":os.path.basename(pdf_path)})
+            except Exception:
+                # ignore table extraction errors
                 pass
-
-            # IMAGES + OCR
-            try:
-                for img in page.images:
-                    bbox = (img["x0"], img["top"], img["x1"], img["bottom"])
-                    im = page.crop(bbox).to_image(resolution=200)
-                    pil_image = Image.frombytes("RGB", im.original.size, im.original.tobytes())
-
-                    ocr_text = ""
-                    if _OCR_OK:
-                        try:
-                            ocr_text = pytesseract.image_to_string(pil_image)
-                        except:
-                            pass
-
-                    chunks.append({
-                        "page": page_num,
-                        "type": "image",
-                        "content": ocr_text if ocr_text.strip() else "[image extracted]",
-                        "source": pdf_path
-                    })
-            except:
-                pass
-
     return chunks
-
 
 def extract_with_pypdf2(pdf_path):
-    """Fallback extractor: text-only, no tables/images."""
     chunks = []
-    reader = PyPDF2.PdfReader(pdf_path)
-
-    for page_num, page in enumerate(reader.pages, start=1):
-        try:
-            text = page.extract_text() or ""
-        except:
-            text = ""
-
-        chunks.append({
-            "page": page_num,
-            "type": "text",
-            "content": text,
-            "source": pdf_path
-        })
-
+    try:
+        reader = PyPDF2.PdfReader(pdf_path)
+        for i, page in enumerate(reader.pages, start=1):
+            try:
+                text = page.extract_text() or ""
+            except Exception:
+                text = ""
+            if text.strip():
+                chunks.append({"type":"text","content":text.strip(),"page":i,"source":os.path.basename(pdf_path)})
+    except Exception as e:
+        print("PyPDF2 extraction failed:", e)
     return chunks
 
-
-# --------------------------------------------------------
-# MAIN FUNCTION
-# --------------------------------------------------------
+def extract_with_pymupdf(pdf_path):
+    chunks = []
+    try:
+        doc = fitz.open(pdf_path)
+        for i, page in enumerate(doc, start=1):
+            try:
+                text = page.get_text("text") or ""
+            except Exception:
+                text = ""
+            if text.strip():
+                chunks.append({"type":"text","content":text.strip(),"page":i,"source":os.path.basename(pdf_path)})
+        doc.close()
+    except Exception as e:
+        print("pymupdf extraction failed:", e)
+    return chunks
 
 def main():
-    # command-line override: python process_document.py --input path.pdf
-    input_path = None
-    if len(sys.argv) > 2 and sys.argv[1] == "--input":
-        input_path = sys.argv[2]
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--input", "-i", help="Path to PDF to process", default=None)
+    args = parser.parse_args()
 
-    # else use config default
-    if not input_path:
-        input_path = config.PDF_PATH
+    ensure_dirs()
 
-    if not os.path.exists(input_path):
-        print(f"\nERROR: PDF not found: {input_path}")
-        return
+    # Determine input PDF
+    pdf_path = args.input or config.PDF_PATH
+    if not pdf_path:
+        print("No PDF provided and config.PDF_PATH is empty. Exiting.")
+        sys.exit(1)
 
-    print("\n======================================================================")
-    print("STEP 1: Document Processing")
-    print("======================================================================\n")
+    if not os.path.exists(pdf_path):
+        print(f"PDF not found: {pdf_path}")
+        sys.exit(1)
 
-    os.makedirs(config.PROCESSED_DATA_DIR, exist_ok=True)
+    print("Found PDF")
+    print(f"Processing document: {pdf_path}")
 
-    print(" Found PDF")
-    print(f"Processing document: {input_path}")
-
-    # -----------------------------------
-    # Choose extraction method
-    # -----------------------------------
     chunks = []
 
-    if _PDFPLUMBER_OK:
-        print(" Using pdfplumber for full extraction (text/tables/images)")
-        chunks = extract_with_pdfplumber(input_path)
-
-    elif _PYPDF2_OK:
-        print(" pdfplumber missing → Using PyPDF2 fallback (text only)")
-        chunks = extract_with_pypdf2(input_path)
-
+    # Prefer pdfplumber for tables; fallback to other readers for text
+    if HAS_PDFPLUMBER:
+        try:
+            chunks = extract_with_pdfplumber(pdf_path)
+            print(f"Extracted {len([c for c in chunks if c['type']=='text'])} text chunks (pdfplumber)")
+            print(f"Extracted {len([c for c in chunks if c['type']=='table'])} tables (pdfplumber)")
+        except Exception as e:
+            print("pdfplumber extraction failed:", e)
+            chunks = []
     else:
-        print("ERROR: Neither pdfplumber nor PyPDF2 available.")
-        return
+        print("pdfplumber not available.")
 
-    print(f"Extracted {len(chunks)} chunks")
+    if not chunks:
+        # try PyPDF2
+        if HAS_PYPDF2:
+            chunks = extract_with_pypdf2(pdf_path)
+            print(f"Extracted {len(chunks)} text chunks (PyPDF2)")
+        elif HAS_PYMUPDF:
+            chunks = extract_with_pymupdf(pdf_path)
+            print(f"Extracted {len(chunks)} text chunks (pymupdf)")
+        else:
+            print("ERROR: Neither pdfplumber nor PyPDF2 nor pymupdf available.")
+            # still write empty chunks file so app doesn't crash
+            chunks = []
 
-    # -----------------------------------
-    # Save chunks
-    # -----------------------------------
-    save_path = config.CHUNKS_PATH
-    with open(save_path, "w", encoding="utf-8") as f:
-        json.dump(chunks, f, ensure_ascii=False, indent=2)
-
-    print(f"Saved chunks to: {save_path}")
-    print("\nProcessing complete.\n")
-
+    # Save chunks JSON
+    try:
+        with open(config.CHUNKS_PATH, "w", encoding="utf-8") as f:
+            json.dump(chunks, f, ensure_ascii=False, indent=2)
+        print(f"Saved {len(chunks)} chunks to {config.CHUNKS_PATH}")
+    except Exception as e:
+        print("Failed to save chunks:", e)
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
