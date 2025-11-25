@@ -1,46 +1,57 @@
 # create_embeddings.py
-import json
 import os
+import sys
+import json
 from vector_store import VectorStore
-import config
+from config import PROCESSED_DATA_DIR, VECTOR_STORE_DIR
+
+"""
+This script loads extracted chunks from `processed/`,
+creates embeddings, builds vector index (FAISS or NumPy fallback),
+and stores results under `data/vector_store/`.
+"""
+
+def load_chunks(processed_dir: str):
+    json_path = os.path.join(processed_dir, "chunks.json")
+    if not os.path.exists(json_path):
+        print("ERROR: chunks.json not found. Run process_document.py first.")
+        sys.exit(1)
+
+    with open(json_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    chunks = data.get("chunks", [])
+    if not chunks:
+        print("ERROR: No chunks found in chunks.json")
+        sys.exit(1)
+
+    print(f"Loaded {len(chunks)} chunks for embedding.")
+    return chunks
+
 
 def main():
+    print("\n==============================")
     print("STEP 2: Creating Embeddings")
-    print()
-    print()
-    
-    if not os.path.exists(config.CHUNKS_PATH):
-        print("\nerror -> Processed data not found")
-        return
-    
-    print("\nprocessed data")
+    print("==============================\n")
 
-    print("\nLoading extracted chunks...")
-    with open(config.CHUNKS_PATH, 'r', encoding='utf-8') as f:
-        chunks = json.load(f)
-    
-    # ASCII-safe print and correct indentation
-    print(f"Loaded {len(chunks)} chunks")
+    # Load extracted chunks
+    chunks = load_chunks(PROCESSED_DATA_DIR)
 
-    text_count = sum(1 for c in chunks if c['type'] == 'text')
-    table_count = sum(1 for c in chunks if c['type'] == 'table')
-    image_count = sum(1 for c in chunks if c['type'] == 'image')
-    
-    print(f"  - Text chunks: {text_count}")
-    print(f"  - Tables: {table_count}")
-    print(f"  - Images: {image_count}")
-    
-    print("\nCreating embeddings...")
-    print()
-    print()
-    
-    vector_store = VectorStore(model_name=config.EMBEDDING_MODEL)
-    vector_store.create_embeddings(chunks)
-    
-    vector_store.save(config.VECTOR_STORE_PATH)
-    
-    print("COMPLETE")
-    print(f"\nTotal vectors: {len(chunks)}")
+    # Initialize VectorStore
+    print("Initializing embedding model...")
+    vs = VectorStore("sentence-transformers/all-MiniLM-L6-v2")
+
+    # Generate embeddings
+    print("Generating embeddings (this may take a moment)...")
+    vs.create_embeddings(chunks)
+
+    # Save vector store
+    print(f"Saving vector store to: {VECTOR_STORE_DIR}")
+    vs.save(VECTOR_STORE_DIR)
+
+    print("\nEmbeddings created and stored successfully!")
+    print(f"Total vectors: {len(chunks)}")
+
 
 if __name__ == "__main__":
     main()
