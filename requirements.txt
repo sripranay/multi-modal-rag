@@ -1,12 +1,12 @@
-streamlit==1.51.0
-sentence-transformers==2.2.2
-numpy==1.26.4
-pdfplumber==0.11.8
-PyPDF2==3.0.1
-pymupdf==1.22.5
-pypdfium2==5.1.0
-tqdm
-transformers==4.36.2
+streamlit
+sentence-transformers
+pdfplumber
+PyPDF2
+numpy
+pandas
+transformers
 torch
-# faiss-cpu is OPTIONAL; do NOT include if building on Cloud is failing
-# faiss-cpu==1.13.0
+pytesseract
+pypdfium2
+pymupdf
+faiss-cpu  # optional: remove this line if Streamlit cloud can't install it
