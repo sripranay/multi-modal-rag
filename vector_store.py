@@ -1,101 +1,188 @@
+# vector_store.py
 """
-vector_store.py
+VectorStore with optional FAISS backend and a NumPy fallback.
 
-Simple VectorStore wrapper using sentence-transformers + faiss.
-Methods:
-  - create_embeddings(chunks): compute embeddings for each chunk and build FAISS
-  - save(path): saves index and chunks metadata
-  - load(path): loads index and chunks metadata
-  - search(query, k=5): returns list of dicts {"chunk": <chunk>, "score": <score>}
+API:
+    vs = VectorStore(model_name="sentence-transformers/all-MiniLM-L6-v2")
+    vs.create_embeddings(chunks)          # chunks: list of dicts {id, content, type, ...}
+    vs.save(path)                         # saves files under `path` directory
+    vs.load(path)                         # loads previously saved index
+    hits = vs.search(query, k=5)          # returns list of dicts: {'chunk': chunk, 'score':score}
 """
+
 import os
 import json
-import pickle
+import errno
+from typing import List, Dict, Any
+import pathlib
 
-import numpy as np
-import faiss
-from sentence_transformers import SentenceTransformer
+# Embedding/model imports
+try:
+    from sentence_transformers import SentenceTransformer
+except Exception as e:
+    SentenceTransformer = None
+    _st_error = e
+
+# numeric ops
+try:
+    import numpy as np
+except Exception as e:
+    np = None
+    _np_error = e
+
+# Optional faiss
+try:
+    import faiss
+    _has_faiss = True
+except Exception:
+    faiss = None
+    _has_faiss = False
+
+# helper
+def _ensure_dir(path):
+    pathlib.Path(path).mkdir(parents=True, exist_ok=True)
+
 
 class VectorStore:
-    def __init__(self, model_name="sentence-transformers/all-MiniLM-L6-v2", dim=None):
+    def __init__(self, model_name: str = "sentence-transformers/all-MiniLM-L6-v2", normalize: bool = True):
+        if SentenceTransformer is None:
+            raise ImportError(f"sentence-transformers is required but not installed: {_st_error}")
+
+        if np is None:
+            raise ImportError(f"numpy is required but not installed: {_np_error}")
+
         self.model_name = model_name
-        self.model = None
+        self.normalize = normalize
+        self.model = SentenceTransformer(model_name)
+        self.chunks: List[Dict[str, Any]] = []
+        self.vectors: np.ndarray = None  # shape (N, D)
         self.index = None
-        self.chunks = []
-        self.dim = dim
+        self.dim = None
+        self._faiss_index_path = None
 
-    def _ensure_model(self):
-        if self.model is None:
-            print(f"Loading embedding model: {self.model_name}")
-            self.model = SentenceTransformer(self.model_name)
-            # set dim if not set
-            if self.dim is None:
-                self.dim = self.model.get_sentence_embedding_dimension()
-            print("successfully loaded")
+    def _encode_texts(self, texts: List[str]) -> np.ndarray:
+        # sentence-transformers returns np.array
+        embs = self.model.encode(texts, show_progress_bar=False, convert_to_numpy=True)
+        if self.normalize:
+            norms = np.linalg.norm(embs, axis=1, keepdims=True)
+            norms[norms == 0] = 1.0
+            embs = embs / norms
+        return embs
 
-    def create_embeddings(self, chunks):
+    def create_embeddings(self, chunks: List[Dict[str, Any]]):
         """
-        chunks: list of dicts with 'content' key
+        chunks: list of dicts with at least 'content' key
         """
-        self._ensure_model()
+        if not chunks:
+            raise ValueError("Empty chunks list")
+
         self.chunks = chunks
         texts = [c.get("content", "") for c in chunks]
-        # encode in batches
-        embeddings = self.model.encode(texts, show_progress_bar=True, convert_to_numpy=True)
-        # ensure dtype float32 for faiss
-        embeddings = np.array(embeddings).astype("float32")
-        # build index
-        self.index = faiss.IndexFlatIP(self.dim)  # inner product for cosine (we will normalize)
-        # normalize embeddings for cosine
-        faiss.normalize_L2(embeddings)
-        self.index.add(embeddings)
-        print(f"FAISS index with {self.index.ntotal} vectors")
+        vectors = self._encode_texts(texts)  # (N, D)
+        self.vectors = vectors.astype(np.float32)
+        self.dim = self.vectors.shape[1]
 
-    def save(self, path):
+        # Try to build FAISS index if available
+        if _has_faiss:
+            try:
+                self.index = faiss.IndexFlatIP(self.dim)  # inner product on normalized vectors -> cosine
+                self.index.add(self.vectors)
+                return
+            except Exception as e:
+                # fallback to numpy if faiss construction fails
+                print(f"FAISS index construction failed, falling back to NumPy search: {e}")
+                self.index = None
+        else:
+            # no faiss available
+            self.index = None
+
+    def save(self, dirpath: str):
         """
-        Save index and chunks metadata. 'path' is directory path.
+        Save vectors and metadata:
+          - dirpath/metadata.json  (list of chunks)
+          - dirpath/vectors.npz    (numpy arrays)
+          - optional: dirpath/faiss.index
         """
-        os.makedirs(path, exist_ok=True)
-        # index file
-        idx_file = os.path.join(path, "index.faiss")
-        faiss.write_index(self.index, idx_file)
+        _ensure_dir(dirpath)
         # metadata
-        meta_file = os.path.join(path, "chunks.pkl")
-        with open(meta_file, "wb") as f:
-            pickle.dump(self.chunks, f)
-        print(f"Saved index to {path}")
+        meta_path = os.path.join(dirpath, "metadata.json")
+        with open(meta_path, "w", encoding="utf-8") as f:
+            json.dump(self.chunks, f, ensure_ascii=False, indent=2)
 
-    def load(self, path):
-        """
-        Load index and metadata from directory.
-        """
-        idx_file = os.path.join(path, "index.faiss")
-        meta_file = os.path.join(path, "chunks.pkl")
-        if not os.path.exists(idx_file) or not os.path.exists(meta_file):
-            raise FileNotFoundError("Index or metadata missing in " + path)
-        self.index = faiss.read_index(idx_file)
-        with open(meta_file, "rb") as f:
-            self.chunks = pickle.load(f)
-        # set dim
-        self.dim = self.index.d
-        # lazy-load model only when creating embeddings or searching with query->embedding
-        print(f"Loaded FAISS index with {self.index.ntotal} vectors")
+        # vectors
+        vec_path = os.path.join(dirpath, "vectors.npz")
+        np.savez_compressed(vec_path, vectors=self.vectors)
 
-    def search(self, query, k=5):
+        # faiss index if present
+        if _has_faiss and self.index is not None:
+            try:
+                faiss.write_index(self.index, os.path.join(dirpath, "faiss.index"))
+            except Exception as e:
+                # non-fatal
+                print(f"Failed to save FAISS index: {e}")
+
+    def load(self, dirpath: str):
         """
-        Returns list of dicts: {"chunk": chunk, "score": score}
-        If model not loaded (for encoding), instantiate it transiently.
+        Load previously saved store. Fills self.chunks and self.vectors.
+        If faiss.index is present and faiss is available, load it.
         """
-        if self.index is None:
-            raise RuntimeError("Index not loaded")
-        # ensure model available to encode query
-        self._ensure_model()
-        q_emb = self.model.encode([query], convert_to_numpy=True).astype("float32")
-        faiss.normalize_L2(q_emb)
-        D, I = self.index.search(q_emb, k)
+        meta_path = os.path.join(dirpath, "metadata.json")
+        vec_path = os.path.join(dirpath, "vectors.npz")
+        if not os.path.exists(meta_path) or not os.path.exists(vec_path):
+            raise FileNotFoundError("No stored vector store found at: " + dirpath)
+
+        with open(meta_path, "r", encoding="utf-8") as f:
+            self.chunks = json.load(f)
+
+        loader = np.load(vec_path, allow_pickle=True)
+        self.vectors = loader["vectors"].astype(np.float32)
+        self.dim = self.vectors.shape[1]
+
+        # try to load faiss
+        if _has_faiss:
+            faiss_path = os.path.join(dirpath, "faiss.index")
+            if os.path.exists(faiss_path):
+                try:
+                    self.index = faiss.read_index(faiss_path)
+                    return
+                except Exception as e:
+                    print(f"Failed loading FAISS index; falling back to NumPy: {e}")
+                    self.index = None
+        else:
+            self.index = None
+
+    def _numpy_search(self, query_vector: np.ndarray, k: int = 5):
+        # both vectors are normalized so cosine == dot product
+        # query_vector: (D,), self.vectors: (N, D)
+        if self.vectors is None:
+            return []
+
+        # compute dot products
+        scores = np.dot(self.vectors, query_vector.astype(np.float32))
+        # get top-k
+        topk_idx = np.argsort(-scores)[:k]
         results = []
-        for score, idx in zip(D[0], I[0]):
-            if idx < 0:
-                continue
-            results.append({"chunk": self.chunks[int(idx)], "score": float(score)})
+        for idx in topk_idx:
+            results.append({"chunk": self.chunks[int(idx)], "score": float(scores[int(idx)])})
         return results
+
+    def search(self, query: str, k: int = 5):
+        """
+        Accepts text query, returns list of {chunk, score}
+        """
+        if self.vectors is None or not self.chunks:
+            return []
+
+        q_vec = self._encode_texts([query])[0]  # shape (D,)
+        if self.index is not None and _has_faiss:
+            # FAISS returns distances; using IndexFlatIP on normalized vectors returns similarity scores
+            D, I = self.index.search(np.expand_dims(q_vec.astype(np.float32), axis=0), k)
+            results = []
+            for score, idx in zip(D[0], I[0]):
+                if int(idx) < 0:
+                    continue
+                results.append({"chunk": self.chunks[int(idx)], "score": float(score)})
+            return results
+        else:
+            # numpy fallback
+            return self._numpy_search(q_vec, k=k)
