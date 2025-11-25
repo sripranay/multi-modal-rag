@@ -1,138 +1,107 @@
-# vector_store.py (safe version for Streamlit Cloud)
-"""
-A safe vector store that:
-- Loads sentence-transformers
-- Falls back to simple search if FAISS unavailable
-- Avoids numpy/npx type annotation errors
-"""
-
+# vector_store.py
 import os
-import json
 import pickle
+from pathlib import Path
 
-# Safe import handling
 try:
     import numpy as np
 except Exception:
-    np = None     # Prevent AttributeError: NoneType.ndarray
-
+    np = None
 
 class VectorStore:
-    def __init__(self, model_name="sentence-transformers/all-MiniLM-L6-v2"):
+    def __init__(self, model_name=None):
         self.model_name = model_name
-        self.model = None
-        self.index = None
-        self.chunks = []
-
+        self.vectors = None  # numpy array (n, d)
+        self.chunks = None   # list of chunk dicts
+        self._use_faiss = False
         try:
-            from sentence_transformers import SentenceTransformer
-            self.model = SentenceTransformer(model_name)
-        except Exception as e:
-            print("SentenceTransformer not available:", e)
-            self.model = None
-
-        # Try FAISS
-        try:
-            import faiss
+            import faiss  # optional
             self.faiss = faiss
+            self._use_faiss = True
         except Exception:
             self.faiss = None
 
-    # ----------------------------------------------------------------------
-
-    def _encode_texts(self, texts):
-        """Encode texts to embeddings using available model."""
-        if self.model is None:
-            raise RuntimeError("Embedding model not loaded. Install sentence-transformers.")
-
-        vectors = self.model.encode(texts, convert_to_numpy=True)
-        # Ensure proper shape
-        if vectors.ndim == 1:
-            vectors = vectors.reshape(1, -1)
-
-        return vectors
-
-    # ----------------------------------------------------------------------
-
-    def create_embeddings(self, chunks):
-        """Create embeddings for chunks."""
-        self.chunks = chunks
-        texts = []
-        for c in chunks:
-            if isinstance(c, dict):
-                text = c.get("content") or c.get("text") or ""
-            else:
-                text = str(c)
-            texts.append(text)
-
-        vectors = self._encode_texts(texts)
-
-        # If FAISS is available
-        if self.faiss is not None:
-            dim = vectors.shape[1]
-            self.index = self.faiss.IndexFlatL2(dim)
-            self.index.add(vectors.astype("float32"))
+    def load(self, path):
+        """
+        path is directory that contains vectors.npy and chunks.pkl
+        """
+        Path(path).mkdir(parents=True, exist_ok=True)
+        vectors_path = os.path.join(path, "vectors.npy")
+        chunks_path = os.path.join(path, "chunks.pkl")
+        if not os.path.exists(vectors_path) or not os.path.exists(chunks_path):
+            raise FileNotFoundError("Vector store files missing in " + path)
+        if np is None:
+            raise RuntimeError("numpy is required for VectorStore")
+        self.vectors = np.load(vectors_path)
+        with open(chunks_path, "rb") as f:
+            self.chunks = pickle.load(f)
+        # build faiss index if available
+        if self._use_faiss:
+            d = self.vectors.shape[1]
+            self.index = self.faiss.IndexFlatIP(d)
+            self.faiss.normalize_L2(self.vectors)
+            self.index.add(self.vectors)
         else:
-            # fallback: store vectors in memory
-            self.index = vectors
-
-    # ----------------------------------------------------------------------
+            self.index = None
 
     def save(self, path):
-        """Save index + chunks"""
-        folder = os.path.dirname(path)
-        os.makedirs(folder, exist_ok=True)
-
-        if self.faiss and isinstance(self.index, self.faiss.IndexFlatL2):
-            self.faiss.write_index(self.index, path)
-        else:
-            with open(path, "wb") as f:
-                pickle.dump(self.index, f)
-
-        # Save chunks
-        with open(path + "_chunks.pkl", "wb") as f:
+        Path(path).mkdir(parents=True, exist_ok=True)
+        np.save(os.path.join(path, "vectors.npy"), self.vectors)
+        with open(os.path.join(path, "chunks.pkl"), "wb") as f:
             pickle.dump(self.chunks, f)
 
-    # ----------------------------------------------------------------------
-
-    def load(self, path):
-        """Load index + chunks"""
-        if self.faiss is not None and os.path.exists(path):
-            try:
-                self.index = self.faiss.read_index(path)
-            except Exception:
-                pass
-
-        if self.index is None:
-            # fallback pickle loader
-            with open(path, "rb") as f:
-                self.index = pickle.load(f)
-
-        # Load chunks
-        chunk_file = path + "_chunks.pkl"
-        if os.path.exists(chunk_file):
-            with open(chunk_file, "rb") as f:
-                self.chunks = pickle.load(f)
-
-    # ----------------------------------------------------------------------
-
-    def search(self, query, k=5):
-        """Search query using FAISS or fallback cosine similarity."""
-        if self.model is None:
-            raise RuntimeError("Model not loaded.")
-
-        q_vec = self.model.encode([query], convert_to_numpy=True).astype("float32")
-
-        # FAISS branch
-        if self.faiss and hasattr(self.index, "search"):
-            D, I = self.index.search(q_vec, k)
-            results = [self.chunks[i] for i in I[0] if i < len(self.chunks)]
-            return results
-
-        # fallback numpy similarity
+    def create_embeddings(self, chunks, embeddings):
+        """
+        If embeddings already provided (numpy array), use them and store
+        chunks: list of dicts
+        embeddings: numpy ndarray shape (n, d)
+        """
         if np is None:
-            raise RuntimeError("Numpy not available for fallback search.")
+            raise RuntimeError("numpy required")
+        self.chunks = chunks
+        self.vectors = embeddings
+        if self._use_faiss:
+            d = embeddings.shape[1]
+            self.index = self.faiss.IndexFlatIP(d)
+            self.faiss.normalize_L2(self.vectors)
+            self.index.add(self.vectors)
 
-        sims = np.dot(self.index, q_vec.T).flatten()
-        topk = sims.argsort()[::-1][:k]
-        return [self.chunks[i] for i in topk]
+    def search(self, query_vector, k=5):
+        """
+        query_vector: ndarray (d,) or text query (not handled here).
+        Returns list of dicts: {"chunk": chunk, "score": score}
+        """
+        if self.vectors is None:
+            return []
+        if isinstance(query_vector, (list, tuple)):
+            import numpy as _np
+            q = _np.array(query_vector)
+        else:
+            q = query_vector
+        if self._use_faiss and self.index is not None:
+            import numpy as _np
+            _np.testing.assert_array_almost_equal(q.shape, (self.vectors.shape[1],), err_msg="query vector has wrong shape")
+            q_norm = q.reshape(1, -1).astype("float32")
+            self.faiss.normalize_L2(q_norm)
+            D, I = self.index.search(q_norm, k)
+            results = []
+            for score, idx in zip(D[0], I[0]):
+                if idx < 0 or idx >= len(self.chunks):
+                    continue
+                results.append({"chunk": self.chunks[idx], "score": float(score)})
+            return results
+        else:
+            # numpy-based cosine similarity
+            import numpy as _np
+            if q.ndim == 1:
+                q = q.reshape(1, -1)
+            # normalize
+            v = self.vectors
+            qn = q / ( _np.linalg.norm(q, axis=1, keepdims=True) + 1e-12)
+            vn = v / ( _np.linalg.norm(v, axis=1, keepdims=True) + 1e-12)
+            scores = (vn @ qn.T).squeeze()  # dot product with normalized vectors -> cosine sims
+            idxs = scores.argsort()[::-1][:k]
+            results = []
+            for idx in idxs:
+                results.append({"chunk": self.chunks[idx], "score": float(scores[idx])})
+            return results
