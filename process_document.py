@@ -1,99 +1,96 @@
-# process_document.py
 import os
 import json
-import argparse
-from pathlib import Path
+import pdfplumber
+from PyPDF2 import PdfReader
 
-# adjust to your config paths OR import config if present
-try:
-    import config
-    RAW_DIR = config.RAW_DATA_DIR
-    PROCESSED_DIR = config.PROCESSED_DIR
-    CHUNKS_PATH = config.CHUNKS_PATH
-except Exception:
-    RAW_DIR = os.path.join("data", "raw")
-    PROCESSED_DIR = os.path.join("data", "processed")
-    CHUNKS_PATH = os.path.join(PROCESSED_DIR, "chunks.json")
+RAW_DIR = "data/raw"
+PROCESSED_DIR = "data/processed"
+IMAGES_DIR = "data/images"
 
-Path(RAW_DIR).mkdir(parents=True, exist_ok=True)
-Path(PROCESSED_DIR).mkdir(parents=True, exist_ok=True)
+CHUNKS_PATH = os.path.join(PROCESSED_DIR, "chunks.json")
 
-def extract_with_pdfplumber(pdf_path):
-    import pdfplumber
-    chunks = []
-    with pdfplumber.open(pdf_path) as pdf:
-        for i, page in enumerate(pdf.pages, start=1):
-            text = (page.extract_text() or "").strip()
-            if text:
-                chunks.append({"type":"text", "page": i, "content": text, "source": os.path.basename(pdf_path)})
-            # extract tables
-            try:
-                tables = page.extract_tables()
-                for t_idx, table in enumerate(tables, start=1):
-                    # Convert table (list of rows) to simple text representation
-                    table_text = "\n".join(["\t".join([cell if cell is not None else "" for cell in row]) for row in table])
-                    chunks.append({"type":"table", "page": i, "content": table_text, "source": os.path.basename(pdf_path)})
-            except Exception:
-                pass
+
+def ensure_dirs():
+    os.makedirs(RAW_DIR, exist_ok=True)
+    os.makedirs(PROCESSED_DIR, exist_ok=True)
+    os.makedirs(IMAGES_DIR, exist_ok=True)
+    print("All directories created")
+
+
+def extract_text_pdfplumber(pdf_path):
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            return "\n".join(page.extract_text() or "" for page in pdf.pages)
+    except Exception as e:
+        print("pdfplumber failed:", e)
+        return None
+
+
+def extract_text_pypdf2(pdf_path):
+    try:
+        reader = PdfReader(pdf_path)
+        return "\n".join(page.extract_text() or "" for page in reader.pages)
+    except Exception as e:
+        print("PyPDF2 failed:", e)
+        return None
+
+
+def chunk_text(text, max_len=800):
+    words = text.split()
+    chunks, current = [], []
+
+    for w in words:
+        current.append(w)
+        if len(current) >= max_len:
+            chunks.append(" ".join(current))
+            current = []
+
+    if current:
+        chunks.append(" ".join(current))
+
     return chunks
 
-def extract_with_pypdf2(pdf_path):
-    from PyPDF2 import PdfReader
-    chunks = []
-    reader = PdfReader(pdf_path)
-    for i, page in enumerate(reader.pages, start=1):
-        try:
-            text = page.extract_text() or ""
-        except Exception:
-            text = ""
-        text = text.strip()
-        if text:
-            chunks.append({"type":"text", "page": i, "content": text, "source": os.path.basename(pdf_path)})
-    return chunks
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--input", "-i", help="input PDF path (optional)", default=None)
-    args = parser.parse_args()
+def process_document(selected_file_path):
+    ensure_dirs()
 
-    if args.input:
-        pdf_path = args.input
-    else:
-        # choose first PDF in RAW_DIR if exists
-        files = [p for p in os.listdir(RAW_DIR) if p.lower().endswith(".pdf")]
-        if not files:
-            print(f"PDF not found: {os.path.join(RAW_DIR, 'default.pdf')}")
-            return
-        pdf_path = os.path.join(RAW_DIR, files[0])
+    if not selected_file_path:
+        print("ERROR: No file selected")
+        return False
+
+    if not os.path.exists(selected_file_path):
+        print("ERROR: File not found:", selected_file_path)
+        return False
 
     print("Found PDF")
-    print("Processing document:", pdf_path)
+    print("Processing document:", selected_file_path)
 
-    chunks = []
-    # try pdfplumber first
-    try:
-        import pdfplumber  # noqa: F401
-        chunks = extract_with_pdfplumber(pdf_path)
-    except Exception as e:
-        print("pdfplumber not available or failed:", str(e))
-        # try pypdf2
-        try:
-            import PyPDF2  # noqa: F401
-            chunks = extract_with_pypdf2(pdf_path)
-        except Exception as e2:
-            print("ERROR: Neither pdfplumber nor PyPDF2 available.")
-            return
+    # --- Try pdfplumber
+    text = extract_text_pdfplumber(selected_file_path)
 
-    # If no chunks found, warn
-    if not chunks:
-        print("No chunks extracted from PDF.")
-    else:
-        print(f"Extracted {len(chunks)} chunks")
-        # save chunks
-        Path(PROCESSED_DIR).mkdir(parents=True, exist_ok=True)
-        with open(CHUNKS_PATH, "w", encoding="utf-8") as f:
-            json.dump(chunks, f, indent=2, ensure_ascii=False)
-        print("Saved chunks to", CHUNKS_PATH)
+    # --- Fallback
+    if not text:
+        text = extract_text_pypdf2(selected_file_path)
+
+    if not text:
+        print("ERROR: Neither pdfplumber nor PyPDF2 available.")
+        return False
+
+    # --- Chunk text
+    chunks = chunk_text(text)
+
+    # Save chunks
+    with open(CHUNKS_PATH, "w", encoding="utf-8") as f:
+        json.dump(chunks, f, indent=2)
+
+    print(f"Saved chunks to {CHUNKS_PATH}")
+    return True
+
 
 if __name__ == "__main__":
-    main()
+    import sys
+    if len(sys.argv) < 2:
+        print("Usage: python process_document.py <pdf_path>")
+        exit()
+
+    process_document(sys.argv[1])
