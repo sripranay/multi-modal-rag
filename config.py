@@ -1,5 +1,7 @@
-# config.py
+# config.py (robust create_directories)
 import os
+import tempfile
+from pathlib import Path
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, 'data')
@@ -9,37 +11,25 @@ PROCESSED_DATA_DIR = os.path.join(DATA_DIR, 'processed')
 VECTOR_STORE_DIR = os.path.join(DATA_DIR, 'vector_store')
 IMAGES_DIR = os.path.join(DATA_DIR, 'images')
 
-# Default PDF path (can be overwritten from Streamlit UI via set_pdf_path)
-PDF_PATH = os.path.join(RAW_DATA_DIR, 'qatar_test_doc.pdf')
-
-CHUNKS_PATH = os.path.join(PROCESSED_DATA_DIR, 'extracted_chunks.json')
-VECTOR_STORE_PATH = os.path.join(VECTOR_STORE_DIR, 'faiss_index')
-
-EMBEDDING_MODEL = 'sentence-transformers/all-MiniLM-L6-v2'
-LLM_MODEL = 'google/flan-t5-base'
-
-def set_pdf_path(path):
-    """Overwrite the PDF that the processing scripts will use."""
-    global PDF_PATH
-    PDF_PATH = path
-
 def create_directories():
-    directories = [
-        DATA_DIR,
-        RAW_DATA_DIR,
-        PROCESSED_DATA_DIR,
-        VECTOR_STORE_DIR,
-        IMAGES_DIR
-    ]
-    for directory in directories:
-        os.makedirs(directory, exist_ok=True)
-    print("All directories created")
-
-if __name__ == "__main__":
-    create_directories()
-    print("\nDirectory structure:")
-    print(f"  Raw data: {RAW_DATA_DIR}")
-    print(f"  Processed data: {PROCESSED_DATA_DIR}")
-    print(f"  Vector store: {VECTOR_STORE_DIR}")
-    print(f"  Images: {IMAGES_DIR}")
-    print(f"\nDefault PDF should be placed at: {PDF_PATH}")
+    desired_dirs = [DATA_DIR, RAW_DATA_DIR, PROCESSED_DATA_DIR, VECTOR_STORE_DIR, IMAGES_DIR]
+    for d in desired_dirs:
+        try:
+            Path(d).mkdir(parents=True, exist_ok=True)
+        except NotADirectoryError:
+            # if a path component is a file, fallback to temp dir
+            fallback_root = os.path.join(tempfile.gettempdir(), "multimodal_rag_data")
+            print(f"Warning: path {d} not creatable; switching to fallback {fallback_root}")
+            # rewrite all paths to a fallback directory and create them
+            global DATA_DIR, RAW_DATA_DIR, PROCESSED_DATA_DIR, VECTOR_STORE_DIR, IMAGES_DIR
+            DATA_DIR = fallback_root
+            RAW_DATA_DIR = os.path.join(DATA_DIR, 'raw')
+            PROCESSED_DATA_DIR = os.path.join(DATA_DIR, 'processed')
+            VECTOR_STORE_DIR = os.path.join(DATA_DIR, 'vector_store')
+            IMAGES_DIR = os.path.join(DATA_DIR, 'images')
+            Path(RAW_DATA_DIR).mkdir(parents=True, exist_ok=True)
+            Path(PROCESSED_DATA_DIR).mkdir(parents=True, exist_ok=True)
+            Path(VECTOR_STORE_DIR).mkdir(parents=True, exist_ok=True)
+            Path(IMAGES_DIR).mkdir(parents=True, exist_ok=True)
+            break
+    print("All directories created (or fallback used)")
